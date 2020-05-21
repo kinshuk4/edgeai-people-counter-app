@@ -19,7 +19,6 @@
  WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
-
 import os
 import sys
 import time
@@ -27,7 +26,7 @@ import socket
 import json
 import cv2
 
-import logging as log
+import logging
 import paho.mqtt.client as mqtt
 
 from argparse import ArgumentParser
@@ -40,6 +39,9 @@ IPADDRESS = socket.gethostbyname(HOSTNAME)
 MQTT_HOST = IPADDRESS
 MQTT_PORT = 3001
 MQTT_KEEPALIVE_INTERVAL = 60
+
+# logging
+logging.basicConfig(filename="./people-counter.log", level=logging.INFO)
 
 
 def build_argparser():
@@ -65,7 +67,7 @@ def build_argparser():
                              "specified (CPU by default)")
     parser.add_argument("-pt", "--prob_threshold", type=float, default=0.5,
                         help="Probability threshold for detections filtering"
-                        "(0.5 by default)")
+                             "(0.5 by default)")
     return parser
 
 
@@ -93,22 +95,28 @@ def infer_on_stream(args, client):
     ### DONE: Load the model through `infer_network` ###
     infer_network.load_model(args.model, args.device, args.cpu_extension)
     net_input_shape = infer_network.get_input_shape()
-    print("Loaded the model. Shape: {}".format(net_input_shape))
+    logging.debug("Loaded the model. Shape: {}".format(net_input_shape))
     ### DONE: Handle the input stream ###
     is_single_image, stream = utils.get_file_type(args.input)
-    print("Got the stream: {}".format(stream))
+    logging.debug("Got the stream: {}".format(stream))
 
     camera = cv2.VideoCapture(stream)
 
     stream_width = int(camera.get(3))
     stream_height = int(camera.get(4))
     if not camera.isOpened():
-        print("Error opening video stream {}".format(args.input))
+        logging.error("Error opening video stream {}".format(args.input))
         exit(1)
 
     last_count = 0
     total_count = 0
-    start_time = 0
+
+    frames_counter = 0  # Number of frames people on screen
+    contiguous_frame_counter = 0  # Number of contiguous frames with same number of people on it
+    fps = int(camera.get(cv2.CAP_PROP_FPS))  # Frames per sec, was 10
+    logging.debug("FPS: {}".format(fps))
+    prev_count = 0
+    contiguous_count_threshold = 5  # half a second as threshold as FPS = 10
     ### DONE: Loop until stream is over ###
     while camera.isOpened():
         ### DONE: Read from the video capture ###
@@ -126,40 +134,51 @@ def infer_on_stream(args, client):
 
         ### DONE: Wait for the result ###
         if infer_network.wait() == 0:
-            ### DONE: Get the results of the inference request ###
+            ### DONE: Get the results of the inference request # ##
             inference_duration = time.time() - inference_start_time
+
             result = infer_network.get_output()
             ### DONE: Extract any desired stats from the results ###
             output_frame, current_count = utils.draw_boxes(input_frame, result, stream_width,
-                                                           stream_height, args.prob_threshold)
+                                                           stream_height, prob_threshold)
+
             ### DONE: Calculate and send relevant information on ###
-            inference_message= "Inference time: {:.3f}ms".format(inference_duration * 1000)
+            inference_message = "Inference time: {:.3f}ms".format(inference_duration * 1000)
             cv2.putText(output_frame, inference_message, (15, 15),
-                       cv2.FONT_HERSHEY_COMPLEX, 0.5, (200, 10, 10), 1)
+                        cv2.FONT_HERSHEY_COMPLEX, 0.5, (200, 10, 10), 1)
             ### current_count, total_count and duration to the MQTT server ###
             ### Topic "person": keys of "count" and "total" ###
             ### Topic "person/duration": key of "duration" ###
-            if current_count > last_count:
-                start_time = time.time()
-                total_count += (current_count - last_count)
-                client.publish("person", json.dumps({"total": total_count}))
-            if current_count < last_count:
-                duration = int(time.time() - start_time)
-                client.publish("person/duration", json.dumps({"duration": duration}))
-            client.publish("person", json.dumps({"count": current_count}))
-            last_count = current_count
-
-        ### DONE: Send the frame to the FFMPEG server ###
+            frames_counter += 1
+            logging.debug(
+                "prev:{} , current:{} , frames:{}, cont_frames:{}, last:{} , total:{}".format(prev_count, current_count,
+                                                                                              frames_counter,
+                                                                                              contiguous_frame_counter,
+                                                                                              last_count, total_count))
+            if current_count != prev_count:
+                prev_count = current_count
+                contiguous_frame_counter = 0
+            else:
+                contiguous_frame_counter += 1
+                if contiguous_frame_counter >= contiguous_count_threshold:
+                    if current_count > last_count:
+                        total_count += (current_count - last_count)
+                        frames_counter = 0  # reset for new people in frame
+                        client.publish("person", json.dumps({"total": total_count, "count": current_count}))
+                    elif current_count < last_count:
+                        duration = int(frames_counter / fps)
+                        client.publish("person/duration", json.dumps({"duration": duration}))
+                    last_count = current_count
+            ### DONE: Send the frame to the FFMPEG server ###
             sys.stdout.buffer.write(output_frame)
             sys.stdout.flush()
-        ### DONE: Write an output image if `single_image_mode` ###
+            ### DONE: Write an output image if `single_image_mode` ###
             if is_single_image:
                 outputFileName = "out_" + os.path.basename(args.input)
                 cv2.imwrite(outputFileName, output_frame)
     camera.release()
     cv2.destroyAllWindows()
     client.disconnect()
-
 
 
 def main():
