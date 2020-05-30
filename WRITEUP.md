@@ -63,7 +63,7 @@ http://download.tensorflow.org/models/object_detection/ssd_mobilenet_v2_coco_201
 tar xvf ssd_mob*
 ```
 
-Then we convert fronzen graph to IR:
+Then we convert frozen graph to IR:
 
 ```bash
 cd ssd_mob*
